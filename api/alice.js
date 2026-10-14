@@ -51,6 +51,8 @@ function aliceResponse(event, text, sessionState = { h: [] }) {
 
 export default {
   async fetch(request) {
+    console.log("Alice webhook invoked");
+
     if (request.method !== "POST") {
       return new Response("Method not allowed", { status: 405 });
     }
@@ -60,8 +62,25 @@ export default {
     try {
       event = await request.json();
     } catch {
-      return Response.json({ error: "Invalid JSON" }, { status: 400 });
+      console.error("Invalid JSON received");
+
+      return Response.json(
+        {
+          version: "1.0",
+          response: {
+            text: "Получен некорректный запрос.",
+            tts: "Получен некорректный запрос.",
+            end_session: false
+          },
+          session_state: { h: [] }
+        },
+        { status: 200 }
+      );
     }
+
+    console.log(
+      `Alice session: ${event?.session?.session_id || "unknown"}`
+    );
 
     const history = readHistory(event);
     const currentState = makeSessionState(history);
@@ -75,7 +94,7 @@ export default {
     if (!phrase) {
       return aliceResponse(
         event,
-        "Привет! Задайте мне вопрос.",
+        "Привет! Это Пригожин Женя.",
         currentState
       );
     }
@@ -91,9 +110,11 @@ export default {
     }
 
     if (!process.env.GROQ_API_KEY) {
+      console.error("GROQ_API_KEY is missing");
+
       return aliceResponse(
         event,
-        "Ключ Groq пока не настроен.",
+        "Ключ проебали, обнови VERCEL.",
         currentState
       );
     }
@@ -122,7 +143,7 @@ export default {
             model: "openai/gpt-oss-120b",
             reasoning: { effort: "low" },
             instructions:
-              "Ты голосовой помощник. Отвечай по-русски, кратко и естественно. Учитывай предыдущие реплики из текущего разговора. Не используй Markdown. Ответ должен быть короче 600 символов.",
+              "Ты голосовой помощник. Отвечай по-русски, кратко и естественно. Учитывай предыдущие реплики из текущего разговора. Не используй Markdown. Ответ должен быть короче 600 символов. Отвечай без лишней воды в хамоватой манере",
             input,
             max_output_tokens: 256
           }),
@@ -139,7 +160,7 @@ export default {
 
         return aliceResponse(
           event,
-          "Не удалось получить ответ. Попробуйте ещё раз.",
+          "Бляяяя, что-то я прослушал. Повтори по-братски.",
           currentState
         );
       }
@@ -155,9 +176,11 @@ export default {
         .trim();
 
       if (!answer) {
+        console.error("Groq returned no output text");
+
         return aliceResponse(
           event,
-          "Не удалось сформировать ответ.",
+          "Туплю, больше не могу отвечать",
           currentState
         );
       }
@@ -168,6 +191,8 @@ export default {
         ["a", answer]
       ]);
 
+      console.log("Alice response completed");
+
       return aliceResponse(event, answer, nextState);
     } catch (error) {
       console.error(
@@ -176,7 +201,7 @@ export default {
 
       return aliceResponse(
         event,
-        "Ответ занял слишком много времени. Попробуйте ещё раз.",
+        "Я заебался. Потом поговорим.",
         currentState
       );
     }
