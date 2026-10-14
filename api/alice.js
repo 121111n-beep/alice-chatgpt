@@ -1,8 +1,8 @@
 import { createClient } from "redis";
 
-const HISTORY_LIMIT = 6;
-const TEXT_LIMIT = 500;
 const SESSION_TTL_SECONDS = 30 * 60;
+const MAX_CONTEXT_MESSAGES = 50;
+const MAX_CONTEXT_CHARS = 6000;
 
 let redisClient;
 let redisConnecting;
@@ -16,7 +16,7 @@ async function getRedis() {
     redisClient = createClient({
       url: process.env.REDIS_URL,
       socket: {
-        connectTimeout: 800
+        connectTimeout: 700
       }
     });
 
@@ -27,11 +27,9 @@ async function getRedis() {
 
   if (!redisClient.isReady && !redisClient.isOpen) {
     if (!redisConnecting) {
-      redisConnecting = redisClient
-        .connect()
-        .finally(() => {
-          redisConnecting = null;
-        });
+      redisConnecting = redisClient.connect().finally(() => {
+        redisConnecting = null;
+      });
     }
 
     await redisConnecting;
@@ -54,53 +52,99 @@ function withTimeout(promise, milliseconds) {
   ]).finally(() => clearTimeout(timeout));
 }
 
-function normalizeHistory(value) {
-  if (!Array.isArray(value)) return [];
+function parseStoredMessage(value) {
+  try {
+    const message = JSON.parse(value);
 
-  return value
-    .filter(
-      (item) =>
-        item &&
-        (item.role === "user" || item.role === "assistant") &&
-        typeof item.content === "string"
-    )
-    .map((item) => ({
-      role: item.role,
-      content: item.content.trim().slice(0, TEXT_LIMIT)
-    }))
-    .filter((item) => item.content)
-    .slice(-HISTORY_LIMIT);
+    if (
+      message &&
+      (message.role === "user" || message.role === "assistant") &&
+      typeof message.content === "string"
+    ) {
+      return {
+        role: message.role,
+        content: message.content
+      };
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
 }
 
-async function loadHistory(key) {
+function fitContext(messages) {
+  const selected = [];
+  let totalCharacters = 0;
+
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    const length = message.content.length;
+
+    if (
+      selected.length > 0 &&
+      totalCharacters + length > MAX_CONTEXT_CHARS
+    ) {
+      break;
+    }
+
+    selected.unshift(message);
+    totalCharacters += length;
+  }
+
+  while (
+    selected.length > 0 &&
+    selected[0].role === "assistant"
+  ) {
+    selected.shift();
+  }
+
+  return selected;
+}
+
+async function loadContext(key) {
   if (!key) return [];
 
   try {
-    const redis = await withTimeout(getRedis(), 700);
-    const saved = await withTimeout(redis.get(key), 500);
+    const redis = await withTimeout(getRedis(), 600);
 
-    if (!saved) return [];
+    const rows = await withTimeout(
+      redis.lRange(key, -MAX_CONTEXT_MESSAGES, -1),
+      450
+    );
 
-    return normalizeHistory(JSON.parse(saved));
+    const messages = rows
+      .map(parseStoredMessage)
+      .filter(Boolean);
+
+    return fitContext(messages);
   } catch (error) {
     console.error(`Redis read failed: ${error.message}`);
     return [];
   }
 }
 
-async function saveHistory(key, history) {
+async function saveExchange(key, userText, assistantText) {
   if (!key) return;
 
   try {
     const redis = await withTimeout(getRedis(), 500);
 
+    const messages = [
+      JSON.stringify({
+        role: "user",
+        content: userText
+      }),
+      JSON.stringify({
+        role: "assistant",
+        content: assistantText
+      })
+    ];
+
+    await withTimeout(redis.rPush(key, messages), 450);
     await withTimeout(
-      redis.set(
-        key,
-        JSON.stringify(normalizeHistory(history)),
-        { EX: SESSION_TTL_SECONDS }
-      ),
-      500
+      redis.expire(key, SESSION_TTL_SECONDS),
+      350
     );
   } catch (error) {
     console.error(`Redis write failed: ${error.message}`);
@@ -112,7 +156,7 @@ async function clearHistory(key) {
 
   try {
     const redis = await withTimeout(getRedis(), 500);
-    await withTimeout(redis.del(key), 500);
+    await withTimeout(redis.del(key), 400);
   } catch (error) {
     console.error(`Redis delete failed: ${error.message}`);
   }
@@ -136,7 +180,9 @@ export default {
     console.log("Alice webhook invoked");
 
     if (request.method !== "POST") {
-      return new Response("Method not allowed", { status: 405 });
+      return new Response("Method not allowed", {
+        status: 405
+      });
     }
 
     let event;
@@ -158,8 +204,11 @@ export default {
 
     const sessionId = event?.session?.session_id;
     const skillId = event?.session?.skill_id || "skill";
+
+    // Новый префикс нужен, чтобы не конфликтовать
+    // со старыми Redis-записями другого типа.
     const redisKey = sessionId
-      ? `alice:${skillId}:${sessionId}`
+      ? `alice:v2:${skillId}:${sessionId}`
       : null;
 
     console.log(`Alice session: ${sessionId || "unknown"}`);
@@ -171,7 +220,10 @@ export default {
     ).trim();
 
     if (!phrase) {
-      return aliceResponse(event, "Привет! Это Пригожин Женя.");
+      return aliceResponse(
+        event,
+        "Привет! Это Пригожин Женя."
+      );
     }
 
     const normalizedPhrase = phrase.toLowerCase();
@@ -187,16 +239,19 @@ export default {
 
     if (!process.env.GROQ_API_KEY) {
       console.error("GROQ_API_KEY is missing");
-      return aliceResponse(event, "Ключ Groq пока не настроен.");
+      return aliceResponse(
+        event,
+        "Ключ Groq пока не настроен."
+      );
     }
 
-    const history = await loadHistory(redisKey);
+    const history = await loadContext(redisKey);
 
     const input = [
       ...history,
       {
         role: "user",
-        content: phrase.slice(0, TEXT_LIMIT)
+        content: phrase
       }
     ];
 
@@ -219,7 +274,7 @@ export default {
             input,
             max_output_tokens: 256
           }),
-          signal: AbortSignal.timeout(2800)
+          signal: AbortSignal.timeout(2700)
         }
       );
 
@@ -248,20 +303,17 @@ export default {
 
       if (!answer) {
         console.error("Groq returned no output text");
-        return aliceResponse(event, "Не удалось сформировать ответ.");
+        return aliceResponse(
+          event,
+          "Не удалось сформировать ответ."
+        );
       }
 
-      await saveHistory(redisKey, [
-        ...history,
-        {
-          role: "user",
-          content: phrase
-        },
-        {
-          role: "assistant",
-          content: answer
-        }
-      ]);
+      await saveExchange(
+        redisKey,
+        phrase,
+        answer
+      );
 
       console.log("Alice response completed");
       return aliceResponse(event, answer);
