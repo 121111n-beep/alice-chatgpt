@@ -1,41 +1,124 @@
-const MAX_HISTORY_ITEMS = 4;
-const MAX_HISTORY_TEXT = 100;
+import { createClient } from "redis";
 
-function readHistory(event) {
-  const history = event?.state?.session?.h;
+const HISTORY_LIMIT = 6;
+const TEXT_LIMIT = 500;
+const SESSION_TTL_SECONDS = 30 * 60;
 
-  if (!Array.isArray(history)) {
-    return [];
+let redisClient;
+let redisConnecting;
+
+async function getRedis() {
+  if (!process.env.REDIS_URL) {
+    throw new Error("REDIS_URL is missing");
   }
 
-  return history
+  if (!redisClient) {
+    redisClient = createClient({
+      url: process.env.REDIS_URL,
+      socket: {
+        connectTimeout: 800
+      }
+    });
+
+    redisClient.on("error", (error) => {
+      console.error(`Redis error: ${error.message}`);
+    });
+  }
+
+  if (!redisClient.isReady && !redisClient.isOpen) {
+    if (!redisConnecting) {
+      redisConnecting = redisClient
+        .connect()
+        .finally(() => {
+          redisConnecting = null;
+        });
+    }
+
+    await redisConnecting;
+  }
+
+  return redisClient;
+}
+
+function withTimeout(promise, milliseconds) {
+  let timeout;
+
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      timeout = setTimeout(
+        () => reject(new Error("Operation timed out")),
+        milliseconds
+      );
+    })
+  ]).finally(() => clearTimeout(timeout));
+}
+
+function normalizeHistory(value) {
+  if (!Array.isArray(value)) return [];
+
+  return value
     .filter(
       (item) =>
-        Array.isArray(item) &&
-        item.length === 2 &&
-        (item[0] === "u" || item[0] === "a")
+        item &&
+        (item.role === "user" || item.role === "assistant") &&
+        typeof item.content === "string"
     )
-    .map(([role, text]) => [
-      role,
-      String(text).trim().slice(0, MAX_HISTORY_TEXT)
-    ])
-    .filter(([, text]) => text)
-    .slice(-MAX_HISTORY_ITEMS);
+    .map((item) => ({
+      role: item.role,
+      content: item.content.trim().slice(0, TEXT_LIMIT)
+    }))
+    .filter((item) => item.content)
+    .slice(-HISTORY_LIMIT);
 }
 
-function makeSessionState(history) {
-  return {
-    h: history
-      .map(([role, text]) => [
-        role,
-        String(text).trim().slice(0, MAX_HISTORY_TEXT)
-      ])
-      .filter(([, text]) => text)
-      .slice(-MAX_HISTORY_ITEMS)
-  };
+async function loadHistory(key) {
+  if (!key) return [];
+
+  try {
+    const redis = await withTimeout(getRedis(), 700);
+    const saved = await withTimeout(redis.get(key), 500);
+
+    if (!saved) return [];
+
+    return normalizeHistory(JSON.parse(saved));
+  } catch (error) {
+    console.error(`Redis read failed: ${error.message}`);
+    return [];
+  }
 }
 
-function aliceResponse(event, text, sessionState = { h: [] }) {
+async function saveHistory(key, history) {
+  if (!key) return;
+
+  try {
+    const redis = await withTimeout(getRedis(), 500);
+
+    await withTimeout(
+      redis.set(
+        key,
+        JSON.stringify(normalizeHistory(history)),
+        { EX: SESSION_TTL_SECONDS }
+      ),
+      500
+    );
+  } catch (error) {
+    console.error(`Redis write failed: ${error.message}`);
+  }
+}
+
+async function clearHistory(key) {
+  if (!key) return;
+
+  try {
+    const redis = await withTimeout(getRedis(), 500);
+    await withTimeout(redis.del(key), 500);
+  } catch (error) {
+    console.error(`Redis delete failed: ${error.message}`);
+  }
+}
+
+function aliceResponse(event, text) {
   const answer = String(text).slice(0, 1000);
 
   return Response.json({
@@ -44,8 +127,7 @@ function aliceResponse(event, text, sessionState = { h: [] }) {
       text: answer,
       tts: answer,
       end_session: false
-    },
-    session_state: sessionState
+    }
   });
 }
 
@@ -64,26 +146,23 @@ export default {
     } catch {
       console.error("Invalid JSON received");
 
-      return Response.json(
-        {
-          version: "1.0",
-          response: {
-            text: "Получен некорректный запрос.",
-            tts: "Получен некорректный запрос.",
-            end_session: false
-          },
-          session_state: { h: [] }
-        },
-        { status: 200 }
-      );
+      return Response.json({
+        version: "1.0",
+        response: {
+          text: "Получен некорректный запрос.",
+          tts: "Получен некорректный запрос.",
+          end_session: false
+        }
+      });
     }
 
-    console.log(
-      `Alice session: ${event?.session?.session_id || "unknown"}`
-    );
+    const sessionId = event?.session?.session_id;
+    const skillId = event?.session?.skill_id || "skill";
+    const redisKey = sessionId
+      ? `alice:${skillId}:${sessionId}`
+      : null;
 
-    const history = readHistory(event);
-    const currentState = makeSessionState(history);
+    console.log(`Alice session: ${sessionId || "unknown"}`);
 
     const phrase = String(
       event?.request?.command ||
@@ -92,11 +171,7 @@ export default {
     ).trim();
 
     if (!phrase) {
-      return aliceResponse(
-        event,
-        "Привет! Это Пригожин Женя.",
-        currentState
-      );
+      return aliceResponse(event, "Привет! Это Пригожин Женя.");
     }
 
     const normalizedPhrase = phrase.toLowerCase();
@@ -106,27 +181,22 @@ export default {
       normalizedPhrase === "забудь контекст" ||
       normalizedPhrase === "начать заново"
     ) {
-      return aliceResponse(event, "Контекст очищен.", { h: [] });
+      await clearHistory(redisKey);
+      return aliceResponse(event, "Контекст очищен.");
     }
 
     if (!process.env.GROQ_API_KEY) {
       console.error("GROQ_API_KEY is missing");
-
-      return aliceResponse(
-        event,
-        "Ключ проебали, обнови VERCEL.",
-        currentState
-      );
+      return aliceResponse(event, "Ключ Groq пока не настроен.");
     }
 
+    const history = await loadHistory(redisKey);
+
     const input = [
-      ...history.map(([role, text]) => ({
-        role: role === "u" ? "user" : "assistant",
-        content: text
-      })),
+      ...history,
       {
         role: "user",
-        content: phrase
+        content: phrase.slice(0, TEXT_LIMIT)
       }
     ];
 
@@ -141,13 +211,15 @@ export default {
           },
           body: JSON.stringify({
             model: "openai/gpt-oss-120b",
-            reasoning: { effort: "low" },
+            reasoning: {
+              effort: "low"
+            },
             instructions:
-              "Ты голосовой помощник. Отвечай по-русски, кратко и естественно. Учитывай предыдущие реплики из текущего разговора. Не используй Markdown. Ответ должен быть короче 600 символов. Отвечай без лишней воды в хамоватой манере",
+              "Ты голосовой помощник. Отвечай по-русски, кратко и естественно. Учитывай предыдущие реплики текущего разговора. Не используй Markdown. Ответ должен быть короче 600 символов.",
             input,
             max_output_tokens: 256
           }),
-          signal: AbortSignal.timeout(3200)
+          signal: AbortSignal.timeout(2800)
         }
       );
 
@@ -160,8 +232,7 @@ export default {
 
         return aliceResponse(
           event,
-          "Бляяяя, что-то я прослушал. Повтори по-братски.",
-          currentState
+          "Не удалось получить ответ. Попробуйте ещё раз."
         );
       }
 
@@ -177,32 +248,33 @@ export default {
 
       if (!answer) {
         console.error("Groq returned no output text");
-
-        return aliceResponse(
-          event,
-          "Туплю, больше не могу отвечать",
-          currentState
-        );
+        return aliceResponse(event, "Не удалось сформировать ответ.");
       }
 
-      const nextState = makeSessionState([
+      await saveHistory(redisKey, [
         ...history,
-        ["u", phrase],
-        ["a", answer]
+        {
+          role: "user",
+          content: phrase
+        },
+        {
+          role: "assistant",
+          content: answer
+        }
       ]);
 
       console.log("Alice response completed");
-
-      return aliceResponse(event, answer, nextState);
+      return aliceResponse(event, answer);
     } catch (error) {
       console.error(
-        error instanceof Error ? error.message : "Groq request failed"
+        error instanceof Error
+          ? error.message
+          : "Groq request failed"
       );
 
       return aliceResponse(
         event,
-        "Я заебался. Потом поговорим.",
-        currentState
+        "Ответ занял слишком много времени. Попробуйте ещё раз."
       );
     }
   }
