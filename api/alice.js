@@ -35,43 +35,44 @@ export default {
       return aliceResponse(event, "Привет! Задайте мне вопрос.");
     }
 
-    if (!process.env.OPENAI_API_KEY) {
-      return aliceResponse(event, "Ключ OpenAI пока не настроен.");
+    if (!process.env.GROQ_API_KEY) {
+      return aliceResponse(event, "Ключ Groq пока не настроен.");
     }
 
     try {
-      const openaiResponse = await fetch(
-        "https://api.openai.com/v1/responses",
+      const groqResponse = await fetch(
+        "https://api.groq.com/openai/v1/responses",
         {
           method: "POST",
           headers: {
-            "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+            Authorization: `Bearer ${process.env.GROQ_API_KEY}`,
             "Content-Type": "application/json"
           },
           body: JSON.stringify({
-            model: "gpt-6-luna",
-            reasoning: {
-              effort: "none"
-            },
+            model: "openai/gpt-oss-120b",
+            reasoning: { effort: "low" },
             instructions:
               "Ты голосовой помощник. Отвечай по-русски, кратко и естественно. Не используй Markdown. Ответ должен быть короче 600 символов.",
             input: phrase,
-            max_output_tokens: 160,
-            store: false
+            max_output_tokens: 256
           }),
           signal: AbortSignal.timeout(3200)
         }
       );
 
-      if (!openaiResponse.ok) {
-        console.error(`OpenAI API error: ${openaiResponse.status}`);
+      if (!groqResponse.ok) {
+        const details = await groqResponse.text();
+        console.error(
+          `Groq API error: ${groqResponse.status} ${details.slice(0, 500)}`
+        );
+
         return aliceResponse(
           event,
           "Не удалось получить ответ. Попробуйте ещё раз."
         );
       }
 
-      const data = await openaiResponse.json();
+      const data = await groqResponse.json();
 
       const answer = (data.output || [])
         .filter((item) => item.type === "message")
@@ -87,7 +88,7 @@ export default {
       );
     } catch (error) {
       console.error(
-        error instanceof Error ? error.message : "OpenAI request failed"
+        error instanceof Error ? error.message : "Groq request failed"
       );
 
       return aliceResponse(
