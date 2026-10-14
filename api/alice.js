@@ -302,7 +302,7 @@ export default {
         .trim();
 
       answer = answer.replace(
-        /(?:Извини(?:те)?,\s*я не могу помочь с этим|I['’]m sorry,\s*but I can['’]t help with that)\.?/gi,
+        /(?:Извини(?:те)?,\s*(?:но\s+)?я не могу помочь с этим|I['’]m sorry,\s*but I can['’]t help with that)\.?/gi,
         "Оооо бля, туплю. Отьебись от меня со своими тупыми вопросами"
       );
 
