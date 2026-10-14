@@ -293,13 +293,18 @@ export default {
 
       const data = await groqResponse.json();
 
-      const answer = (data.output || [])
+      let answer = (data.output || [])
         .filter((item) => item.type === "message")
         .flatMap((item) => item.content || [])
         .filter((part) => part.type === "output_text")
         .map((part) => part.text)
         .join("\n")
         .trim();
+
+      answer = answer.replace(
+        /Извини(?:те)?,\s*я не могу помочь с этим\.?/gi,
+        "Оооо бля, туплю. Отьебись от меня со своими тупыми вопросами"
+      );
 
       if (!answer) {
         console.error("Groq returned no output text");
